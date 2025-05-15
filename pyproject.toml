@@ -1,0 +1,42 @@
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robot-fight-detector"
+version = "1.0.0"
+description = "CLI tool to detect robot fights in videos using SmolVLM2"
+readme = "README.md"
+requires-python = ">=3.12.3"
+license = "MIT"
+authors = [
+    { name = "ricklon", email = "ricklon@fubarlabs.org" },
+]
+dependencies = [
+    "click>=8.2.0",
+    "ffmpeg-python>=0.2.0",
+    "num2words>=0.5.14",
+    "opencv-python>=4.11.0.86",
+    "pillow>=11.2.1",
+    "python-dotenv>=1.1.0",
+    "torch>=2.7.0",
+    "transformers>=4.51.3",
+    "yt-dlp>=2025.4.30",
+]
+
+
+[project.scripts]
+robot-fight-detector = "robot_fight_detector:cli"
+
+[project.urls]
+Homepage = "https://github.com/ricklon/robot-fight-detector"
+Repository = "https://github.com/ricklon/robot-fight-detector"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "isort>=5.0.0",
+    "flake8>=6.0.0",
+]
