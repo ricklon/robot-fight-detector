@@ -118,16 +118,52 @@ robot-fight-detector detect videos/long_tournament.mp4 --no-save-frames --extrac
 robot-fight-detector detect videos/tournament_5hours.mp4 --format vtt --extract-clips --no-save-frames --interval 15 --clip-quality low
 ```
 
+### Processing YouTube Livestreams
+
+```bash
+# Process a YouTube livestream in real-time
+robot-fight-detector livestream YOUTUBE_URL [OPTIONS]
+
+# Example with basic options
+robot-fight-detector livestream https://www.youtube.com/watch?v=STREAM_ID
+
+# Process livestream with WebVTT output and custom interval
+robot-fight-detector livestream https://www.youtube.com/watch?v=STREAM_ID --format vtt --interval 2
+
+# Limit processing duration to 30 minutes
+robot-fight-detector livestream https://www.youtube.com/watch?v=STREAM_ID --duration 30
+
+# Process stream without saving frames (reduces disk usage)
+robot-fight-detector livestream https://www.youtube.com/watch?v=STREAM_ID --no-save-frames
+
+# Customize stream URL refresh interval (in seconds, default: 300)
+robot-fight-detector livestream https://www.youtube.com/watch?v=STREAM_ID --refresh-interval 600
+```
+
+Note: The livestream feature requires `yt-dlp` which is installed with the package. Press Ctrl+C at any time to stop livestream processing and save results.
+
 ### Options
+
+#### Common Options (all commands)
 
 - `--output-dir`, `-o`: Custom output directory (default: `./robot_fights_output`)
 - `--interval`, `-i`: Analysis interval in seconds (default: `1.0`)
 - `--model`, `-m`: Alternative model to use
 - `--format`, `-f`: Output format (`json` or `vtt`, default: `json`)
 - `--save-frames/--no-save-frames`: Whether to save detected frame images (default: `--save-frames`)
+- `--event-name`: Name of robot combat event for better robot identification (e.g., "BattleBots Season 6")
+
+#### Video Processing Options
+
 - `--extract-clips/--no-extract-clips`: Extract video clips for each fight segment (default: `--no-extract-clips`)
 - `--clip-padding`: Seconds to add before and after each fight clip (default: `2.0`)
 - `--clip-quality`: Quality of extracted clips (`low`, `medium`, `high`, default: `medium`)
+
+#### Livestream Processing Options
+
+- `--duration`, `-d`: Duration in minutes to process the stream (default: continuous until Ctrl+C)
+- `--refresh-interval`: How often to refresh the stream URL in seconds (default: `300`)
+- All other video options apply to livestreams as well
 
 ## Output
 

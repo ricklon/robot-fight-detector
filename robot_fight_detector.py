@@ -19,6 +19,11 @@ from collections import defaultdict
 import ffmpeg
 import subprocess
 import shutil
+import time
+import yt_dlp
+import threading
+import signal
+import sys
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,6 +32,8 @@ load_dotenv()
 DEFAULT_MODEL = os.getenv("MODEL_NAME", "HuggingFaceTB/SmolVLM2-2.2B-Instruct")
 DEFAULT_OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./robot_fights_output")
 DEFAULT_INTERVAL = float(os.getenv("DEFAULT_INTERVAL", "1.0"))
+DEFAULT_STREAM_REFRESH_INTERVAL = int(os.getenv("STREAM_REFRESH_INTERVAL", "300"))  # 5 minutes
+DEFAULT_EVENT_NAME = os.getenv("EVENT_NAME", "")  # Optional event name
 
 # Helper functions for WebVTT output
 def format_timestamp(seconds):
@@ -47,10 +54,32 @@ def extract_robot_names(response):
         robot1 = match.group(1).strip()
         robot2 = match.group(2).strip()
         description = match.group(3).strip()
+        
+        # Sanitize robot names to avoid trademark issues
+        trademark_replacements = {
+            r"(?i)battlebots?": "combat robot",
+            r"(?i)battlebots?\s+competition": "robot competition",
+            r"(?i)battle\s*bots?": "combat robot" 
+        }
+        
+        for pattern, replacement in trademark_replacements.items():
+            robot1 = re.sub(pattern, replacement, robot1)
+            robot2 = re.sub(pattern, replacement, robot2)
+            description = re.sub(pattern, replacement, description)
+        
         return robot1, robot2, description
     
     # If the format doesn't match exactly, just use the whole response
-    return "Unknown", "Unknown", response.replace("YES.", "").strip()
+    sanitized_response = response.replace("YES.", "").strip()
+    # Apply trademark replacements to the full response
+    for pattern, replacement in {
+        r"(?i)battlebots?": "combat robot",
+        r"(?i)battlebots?\s+competition": "robot competition",
+        r"(?i)battle\s*bots?": "combat robot"
+    }.items():
+        sanitized_response = re.sub(pattern, replacement, sanitized_response)
+    
+    return "Unknown", "Unknown", sanitized_response
 
 def group_segments(detections, interval, min_gap=5.0):
     """Group detections into continuous fight segments with start/end times"""
@@ -223,11 +252,34 @@ def extract_fight_clips(video_path, segments, output_dir, padding=2.0, quality="
         
     return clips
 
+def get_stream_url(url):
+    """Extract actual video URL from YouTube link using yt-dlp
+    
+    Args:
+        url (str): YouTube URL to extract stream from
+        
+    Returns:
+        tuple: (stream_url, stream_title)
+    """
+    ydl_opts = {
+        'format': 'best[height<=720]',  # Limit resolution to reduce processing load
+        'quiet': True
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            stream_title = info.get('title', 'Unknown Stream')
+            return info['url'], stream_title
+    except Exception as e:
+        raise click.ClickException(f"Failed to extract stream URL: {str(e)}")
+
 
 class RobotFightDetector:
-    def __init__(self, model_name=None):
+    def __init__(self, model_name=None, event_name=None):
         """Initialize the robot fight detector with SmolVLM2 model."""
         self.model_name = model_name if model_name else DEFAULT_MODEL
+        self.event_name = event_name if event_name is not None else DEFAULT_EVENT_NAME
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         click.echo(f"Loading SmolVLM2 model on {self.device}...")
         
@@ -248,6 +300,9 @@ class RobotFightDetector:
                 token=hf_token
             ).to(self.device)
             click.echo("✓ Model loaded successfully!")
+            
+            if self.event_name:
+                click.echo(f"✓ Using event context: {self.event_name}")
         except Exception as e:
             click.echo(f"Error loading model: {e}", err=True)
             raise
@@ -259,7 +314,9 @@ class RobotFightDetector:
         image = Image.fromarray(frame_rgb)
         
         # Prepare prompt for robot fight detection with robot identification
-        prompt = """Look at this image carefully. Are there any robots fighting or engaging in combat?
+        event_context = f"\nThis is from the event: {self.event_name}.\n" if self.event_name else ""
+        
+        prompt = f"""Look at this image carefully. Are there any robots fighting or engaging in combat?{event_context}
         
         If you see robots fighting, respond in this exact format:
         YES. [Robot 1 Name] vs [Robot 2 Name]: Brief description of what's happening in the fight.
@@ -267,12 +324,19 @@ class RobotFightDetector:
         If there are no robot fights, just respond with:
         NO.
         
+        For robot identification:
+        - Use actual robot names if visible in the image
+        - If names aren't visible, use "Red Bot" or "Blue Bot" based on their starting zones
+        - If zones aren't visible, use generic terms like "Bot 1" and "Bot 2" or describe them by appearance/weapons
+        - Avoid using any trademarked terms like "BattleBots" - use "combat robots" instead
+        
         Look for:
-        - Robots in combat positions or arenas (especially BattleBots competitions)
+        - Robots in combat positions or arenas (combat robot competitions)
         - Robot battles or fights with visible damage or attacks
         - Names or identifiers of the robots (often visible on the robots or arena)
         - Types of weapons the robots are using (spinners, flippers, hammers, etc.)
-        - The specific action happening at this moment (attacking, defending, etc.)"""
+        - The specific action happening at this moment (attacking, defending, etc.)
+        - Color zones (red/blue) that might indicate which robot is which"""
         
         try:
             # Process with SmolVLM2 using the chat template API
@@ -431,6 +495,216 @@ class RobotFightDetector:
             return results, results_file
         
         return results, results_file
+        
+    def process_livestream(self, stream_url, output_dir, interval=1.0, save_frames=True, 
+                        output_format="json", extract_clips=False, clip_padding=2.0, 
+                        clip_quality="medium", duration=None, refresh_interval=DEFAULT_STREAM_REFRESH_INTERVAL):
+        """Process a YouTube livestream to find robot fights.
+        
+        Args:
+            stream_url (str): YouTube livestream URL
+            output_dir (Path): Directory to save results
+            interval (float): Sample frame every N seconds
+            save_frames (bool): Whether to save detected frames
+            output_format (str): Output format ("json" or "vtt")
+            extract_clips (bool): Whether to extract fight clips
+            clip_padding (float): Seconds to add before/after clips
+            clip_quality (str): Quality of extracted clips
+            duration (float): Duration in minutes to process (None for continuous)
+            refresh_interval (int): How often to refresh the stream URL in seconds
+            
+        Returns:
+            tuple: (results, results_file)
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Extract the actual stream URL from YouTube
+        real_url, stream_title = get_stream_url(stream_url)
+        
+        click.echo(f"Processing livestream: {stream_title}")
+        click.echo(f"Analyzing every {interval}s")
+        
+        # Set up results file name from YouTube title
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", stream_title).replace(" ", "_")
+        results_file = output_dir / f"{safe_title}_robot_fights.json"
+        
+        # Initialize capture
+        cap = cv2.VideoCapture(real_url)
+        if not cap.isOpened():
+            raise click.ClickException(f"Could not open stream URL")
+        
+        # Get FPS and calculate frame interval
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_interval = int(fps * interval)
+        
+        # Set up duration limit if specified
+        end_time = None
+        if duration:
+            end_time = time.time() + (duration * 60)
+            click.echo(f"Will process for {duration} minutes")
+        
+        # Initialize variables
+        detections = []
+        frame_count = 0
+        processed_frames = 0
+        start_time = time.time()
+        last_refresh_time = start_time
+        elapsed_time = 0
+        
+        # Setup for handling interrupts
+        stop_event = threading.Event()
+        
+        def signal_handler(sig, frame):
+            click.echo("\nInterrupted! Finishing processing...")
+            stop_event.set()
+            
+        original_sigint = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal_handler)
+        
+        try:
+            with click.progressbar(
+                length=100, 
+                label=f"Processing livestream",
+                show_eta=False
+            ) as bar:
+                last_update = 0
+                
+                while not stop_event.is_set():
+                    # Check if we need to refresh the stream URL
+                    current_time = time.time()
+                    if current_time - last_refresh_time > refresh_interval:
+                        click.echo("\nRefreshing stream URL...")
+                        cap.release()
+                        real_url, _ = get_stream_url(stream_url)
+                        cap = cv2.VideoCapture(real_url)
+                        if not cap.isOpened():
+                            click.echo("Error: Could not reopen stream. Trying again...")
+                            time.sleep(5)
+                            continue
+                        last_refresh_time = current_time
+                    
+                    # Check if we've reached the duration limit
+                    if end_time and current_time > end_time:
+                        click.echo("\nReached specified duration. Stopping...")
+                        break
+                    
+                    # Read frame
+                    ret, frame = cap.read()
+                    if not ret:
+                        click.echo("\nStream ended or frame could not be read. Trying to reconnect...")
+                        cap.release()
+                        time.sleep(5)  # Wait before reconnecting
+                        real_url, _ = get_stream_url(stream_url)
+                        cap = cv2.VideoCapture(real_url)
+                        continue
+                    
+                    # Process frame at the specified interval
+                    if frame_count % frame_interval == 0:
+                        elapsed_time = current_time - start_time
+                        timestamp = elapsed_time
+                        
+                        # Analyze frame
+                        is_fight, description = self.analyze_frame(frame)
+                        
+                        if is_fight:
+                            # Save frame if requested
+                            frame_filename = None
+                            if save_frames:
+                                frame_filename = f"robot_fight_{timestamp:.2f}s.jpg"
+                                frame_path = output_dir / frame_filename
+                                cv2.imwrite(str(frame_path), frame)
+                            
+                            # Add detection
+                            detection = {
+                                "timestamp": timestamp,
+                                "frame_number": frame_count,
+                                "description": description,
+                                "frame_file": frame_filename,
+                                "time": datetime.now().isoformat()
+                            }
+                            detections.append(detection)
+                            
+                            # Create temporary clip if requested
+                            if extract_clips:
+                                # Save a short clip of the detected fight
+                                clip_filename = f"live_robot_fight_{timestamp:.2f}s.mp4"
+                                clip_path = output_dir / "clips" / clip_filename
+                                output_dir.joinpath("clips").mkdir(exist_ok=True)
+                                
+                                # Save current frame as a placeholder until we implement proper clip extraction
+                                cv2.imwrite(str(output_dir / "clips" / f"frame_{timestamp:.2f}s.jpg"), frame)
+                            
+                            # Print detection
+                            click.echo(f"\n✓ Robot fight detected at {timestamp:.2f}s")
+                            click.echo(f"  Description: {description}")
+                            
+                            # Periodically save results to file
+                            results = {
+                                "stream_url": stream_url,
+                                "stream_title": stream_title,
+                                "analysis_date": datetime.now().isoformat(),
+                                "total_detections": len(detections),
+                                "detections": detections,
+                                "settings": {
+                                    "interval": interval,
+                                    "model": self.model_name
+                                }
+                            }
+                            
+                            with open(results_file, 'w') as f:
+                                json.dump(results, f, indent=2)
+                        
+                        processed_frames += 1
+                        
+                        # Update progress bar every 5 seconds
+                        if int(elapsed_time) // 5 > last_update:
+                            last_update = int(elapsed_time) // 5
+                            bar.update(1)
+                            if bar.length <= bar.pos:
+                                bar.length = bar.pos + 100
+                    
+                    frame_count += 1
+                    
+                    # Small delay to prevent CPU overload
+                    time.sleep(0.01)
+        
+        finally:
+            # Restore original signal handler
+            signal.signal(signal.SIGINT, original_sigint)
+            
+            # Release capture
+            cap.release()
+            
+            # Final results
+            results = {
+                "stream_url": stream_url,
+                "stream_title": stream_title,
+                "analysis_date": datetime.now().isoformat(),
+                "analysis_duration": time.time() - start_time,
+                "total_detections": len(detections),
+                "detections": detections,
+                "settings": {
+                    "interval": interval,
+                    "model": self.model_name
+                }
+            }
+            
+            # Save final results
+            with open(results_file, 'w') as f:
+                json.dump(results, f, indent=2)
+            
+            # Process segments if needed
+            if output_format.lower() == "vtt" and detections:
+                segments = group_segments(detections, interval)
+                results["segments"] = segments
+                
+                # Create WebVTT file
+                vtt_file = output_dir / f"{safe_title}_robot_fights.vtt"
+                create_webvtt(segments, vtt_file)
+                results["vtt_file"] = str(vtt_file)
+            
+            return results, results_file
 
 
 @click.group()
@@ -458,8 +732,10 @@ def cli():
               help='Seconds to add before and after each fight clip (default: 2.0)')
 @click.option('--clip-quality', type=click.Choice(['low', 'medium', 'high']), default='medium',
               help='Quality of extracted clips (default: medium)')
+@click.option('--event-name', type=str, default=DEFAULT_EVENT_NAME,
+              help='Name of robot combat event for better robot identification')
 def detect(video_path, output_dir, interval, model, output_format, save_frames, 
-           extract_clips, clip_padding, clip_quality):
+           extract_clips, clip_padding, clip_quality, event_name):
     """Detect robot fights in a video file."""
     try:
         # Make sure ffmpeg is installed if extracting clips
@@ -480,7 +756,7 @@ def detect(video_path, output_dir, interval, model, output_format, save_frames,
                            "Please install ffmpeg: https://ffmpeg.org/download.html", err=True)
                 raise click.Abort()
         
-        detector = RobotFightDetector(model_name=model)
+        detector = RobotFightDetector(model_name=model, event_name=event_name)
         results, results_file = detector.process_video(
             video_path, output_dir, interval, 
             output_format=output_format, 
@@ -520,13 +796,106 @@ def detect(video_path, output_dir, interval, model, output_format, save_frames,
 
 
 @cli.command()
+@click.argument('stream_url')
+@click.option('--output-dir', '-o', type=click.Path(path_type=Path), 
+              default=DEFAULT_OUTPUT_DIR, help=f'Output directory for results (default: {DEFAULT_OUTPUT_DIR})')
+@click.option('--interval', '-i', type=float, default=DEFAULT_INTERVAL, 
+              help=f'Analyze every N seconds (default: {DEFAULT_INTERVAL})')
+@click.option('--model', '-m', default=DEFAULT_MODEL,
+              help=f'SmolVLM2 model to use (default: {DEFAULT_MODEL})')
+@click.option('--format', '-f', 'output_format', type=click.Choice(['json', 'vtt']), default='json',
+              help='Output format (json or vtt)')
+@click.option('--save-frames/--no-save-frames', default=True,
+              help='Save frames of detected robot fights (default: True)')
+@click.option('--extract-clips/--no-extract-clips', default=False,
+              help='Extract video clips for each fight segment (default: False)')
+@click.option('--clip-padding', type=float, default=2.0,
+              help='Seconds to add before and after each fight clip (default: 2.0)')
+@click.option('--clip-quality', type=click.Choice(['low', 'medium', 'high']), default='medium',
+              help='Quality of extracted clips (default: medium)')
+@click.option('--duration', '-d', type=float, default=None,
+              help='Duration in minutes to process the stream (default: continuous)')
+@click.option('--refresh-interval', type=int, default=DEFAULT_STREAM_REFRESH_INTERVAL,
+              help=f'How often to refresh the stream URL in seconds (default: {DEFAULT_STREAM_REFRESH_INTERVAL})')
+@click.option('--event-name', type=str, default=DEFAULT_EVENT_NAME,
+              help='Name of robot combat event for better robot identification')
+def livestream(stream_url, output_dir, interval, model, output_format, save_frames, 
+               extract_clips, clip_padding, clip_quality, duration, refresh_interval, event_name):
+    """Process a YouTube livestream URL to detect robot fights in real-time.
+    
+    STREAM_URL should be a YouTube livestream URL like:
+    https://www.youtube.com/watch?v=mt3hlsjx3dE
+    
+    The tool will continuously monitor the stream for robot fights.
+    Press Ctrl+C to stop processing at any time.
+    """
+    try:
+        # Check if URL is valid
+        if not stream_url.startswith(('http://', 'https://')):
+            raise click.ClickException("Invalid URL. Please provide a valid YouTube URL.")
+        
+        # Make sure yt-dlp is available
+        try:
+            yt_dlp_version = subprocess.run(
+                ["yt-dlp", "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            ).stdout.strip()
+            click.echo(f"Using yt-dlp version: {yt_dlp_version}")
+        except FileNotFoundError:
+            click.echo("Error: yt-dlp is required for livestream processing but not found.", err=True)
+            raise click.Abort()
+            
+        # Initialize detector
+        detector = RobotFightDetector(model_name=model, event_name=event_name)
+        
+        # Process livestream
+        results, results_file = detector.process_livestream(
+            stream_url, output_dir, interval,
+            save_frames=save_frames,
+            output_format=output_format,
+            extract_clips=extract_clips,
+            clip_padding=clip_padding,
+            clip_quality=clip_quality,
+            duration=duration,
+            refresh_interval=refresh_interval
+        )
+        
+        # Display summary
+        click.echo(f"\n🤖 Livestream processing complete!")
+        click.echo(f"Found {results['total_detections']} robot fight scenes")
+        click.echo(f"Results saved to: {results_file}")
+        
+        if save_frames and results['total_detections'] > 0:
+            click.echo(f"Frames saved to: {output_dir}")
+        
+        # If WebVTT was generated, display information about segments
+        if 'segments' in results:
+            click.echo(f"\nIdentified {len(results['segments'])} fight segments:")
+            for i, segment in enumerate(results['segments']):
+                robots = " vs ".join(segment['robots'][:2])
+                click.echo(f"  • Fight {i+1}: {format_timestamp(segment['start'])} - {format_timestamp(segment['end'])} ({robots})")
+        elif results['total_detections'] > 0:
+            click.echo("\nDetected robot fights:")
+            for detection in results['detections']:
+                click.echo(f"  • {detection['timestamp']:.2f}s: {detection['description']}")
+    
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
+
+
+@cli.command()
 @click.argument('image_path', type=click.Path(exists=True, path_type=Path))
 @click.option('--model', '-m', default=DEFAULT_MODEL,
               help=f'SmolVLM2 model to use (default: {DEFAULT_MODEL})')
-def analyze_image(image_path, model):
+@click.option('--event-name', type=str, default=DEFAULT_EVENT_NAME,
+              help='Name of robot combat event for better robot identification')
+def analyze_image(image_path, model, event_name):
     """Analyze a single image for robot fights."""
     try:
-        detector = RobotFightDetector(model_name=model)
+        detector = RobotFightDetector(model_name=model, event_name=event_name)
         
         # Load image
         frame = cv2.imread(str(image_path))
@@ -560,11 +929,24 @@ def test(skip_model):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         click.echo(f"✓ PyTorch device: {device}")
         
+        # Check for yt-dlp
+        try:
+            yt_dlp_version = subprocess.run(
+                ["yt-dlp", "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            ).stdout.strip()
+            click.echo(f"✓ yt-dlp version: {yt_dlp_version}")
+        except FileNotFoundError:
+            click.echo("⚠ yt-dlp was not found in system PATH. Livestream processing will not work.", err=True)
+        
         # Check environment variables
         click.echo("\nEnvironment configuration:")
         click.echo(f"✓ MODEL_NAME: {DEFAULT_MODEL}")
         click.echo(f"✓ OUTPUT_DIR: {DEFAULT_OUTPUT_DIR}")
         click.echo(f"✓ DEFAULT_INTERVAL: {DEFAULT_INTERVAL}")
+        click.echo(f"✓ STREAM_REFRESH_INTERVAL: {DEFAULT_STREAM_REFRESH_INTERVAL}")
         
         hf_token = os.getenv("HUGGINGFACE_TOKEN")
         if not hf_token:
