@@ -44,42 +44,85 @@ def format_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}".replace(".", ":")
 
 def extract_robot_names(response):
-    """Extract robot names from model response"""
+    """Extract robot names, status, and match details from model response"""
+    # If response indicates no robots or no fight, return None values
+    if response.upper().startswith("NO ROBOTS") or response.upper().startswith("NO FIGHT"):
+        return None, None, response
+    
     if not response.upper().startswith("YES"):
         return None, None, ""
     
-    # Try to extract [Robot 1] vs [Robot 2]: Description format
-    match = re.search(r"YES\.\s*\[?([^][\n:]+?)\]?\s+(?:vs|VS|versus)\s+\[?([^][\n:]+?)\]?[:\.](.*)", response)
+    # Initialize default values for all fields
+    robot1 = "Unknown"
+    robot2 = "Unknown"
+    description = ""
+    status = "Ongoing"  # Default status
+    sponsors = ""
+    damage = ""
+    timer = ""
+    score = ""
+    
+    # Try to extract [Robot 1] vs [Robot 2]: Description format from the first line
+    lines = response.strip().split('\n')
+    first_line = lines[0]
+    
+    match = re.search(r"YES\.\s*\[?([^][\n:]+?)\]?\s+(?:vs|VS|versus)\s+\[?([^][\n:]+?)\]?[:\.](.*)", first_line)
     if match:
         robot1 = match.group(1).strip()
         robot2 = match.group(2).strip()
         description = match.group(3).strip()
-        
-        # Sanitize robot names to avoid trademark issues
-        trademark_replacements = {
-            r"(?i)battlebots?": "combat robot",
-            r"(?i)battlebots?\s+competition": "robot competition",
-            r"(?i)battle\s*bots?": "combat robot" 
-        }
-        
-        for pattern, replacement in trademark_replacements.items():
-            robot1 = re.sub(pattern, replacement, robot1)
-            robot2 = re.sub(pattern, replacement, robot2)
-            description = re.sub(pattern, replacement, description)
-        
-        return robot1, robot2, description
     
-    # If the format doesn't match exactly, just use the whole response
-    sanitized_response = response.replace("YES.", "").strip()
-    # Apply trademark replacements to the full response
-    for pattern, replacement in {
+    # Extract additional information from remaining lines
+    for line in lines[1:]:
+        line = line.strip()
+        
+        # Extract match status
+        if line.startswith("Status:"):
+            status_value = line.replace("Status:", "").strip()
+            status = status_value
+        
+        # Extract sponsors
+        elif line.startswith("Sponsors:"):
+            sponsors = line.replace("Sponsors:", "").strip()
+        
+        # Extract damage information
+        elif line.startswith("Damage:"):
+            damage = line.replace("Damage:", "").strip()
+        
+        # Extract timer information
+        elif line.startswith("Timer:"):
+            timer = line.replace("Timer:", "").strip()
+        
+        # Extract score information
+        elif line.startswith("Score:"):
+            score = line.replace("Score:", "").strip()
+    
+    # Sanitize robot names to avoid trademark issues
+    trademark_replacements = {
         r"(?i)battlebots?": "combat robot",
         r"(?i)battlebots?\s+competition": "robot competition",
-        r"(?i)battle\s*bots?": "combat robot"
-    }.items():
-        sanitized_response = re.sub(pattern, replacement, sanitized_response)
+        r"(?i)battle\s*bots?": "combat robot" 
+    }
     
-    return "Unknown", "Unknown", sanitized_response
+    for pattern, replacement in trademark_replacements.items():
+        robot1 = re.sub(pattern, replacement, robot1)
+        robot2 = re.sub(pattern, replacement, robot2)
+        description = re.sub(pattern, replacement, description)
+        sponsors = re.sub(pattern, replacement, sponsors)
+    
+    # Create a structured response dictionary
+    match_info = {
+        "robot1": robot1,
+        "robot2": robot2,
+        "description": description,
+        "status": status,
+        "sponsors": sponsors,
+        "damage": damage,
+        "timer": timer,
+        "score": score
+    }
+    
+    return robot1, robot2, description, match_info
 
 def group_segments(detections, interval, min_gap=5.0):
     """Group detections into continuous fight segments with start/end times"""
@@ -93,45 +136,159 @@ def group_segments(detections, interval, min_gap=5.0):
     current_segment = {
         "start": sorted_detections[0]["timestamp"],
         "robots": set(),
-        "descriptions": []
+        "descriptions": [],
+        "sponsors": set(),
+        "match_status": [],
+        "damage_reports": []
     }
     
     last_timestamp = sorted_detections[0]["timestamp"]
     
-    for detection in sorted_detections[1:]:
-        # Extract robot names
-        robot1, robot2, desc = extract_robot_names(detection["description"])
+    # Process first detection
+    first_detection = sorted_detections[0]
+    try:
+        robot1, robot2, desc, match_info = extract_robot_names(first_detection["description"])
         
-        # If robots are detected, add them to the set
+        # Add match info to the first segment
         if robot1 and robot1 != "Unknown":
             current_segment["robots"].add(robot1)
         if robot2 and robot2 != "Unknown":
             current_segment["robots"].add(robot2)
             
-        # Add description
+        # Add description and other details
         if desc:
             current_segment["descriptions"].append({
-                "time": detection["timestamp"],
+                "time": first_detection["timestamp"],
                 "text": desc
             })
         
-        # Check if this is part of the same segment (gap less than min_gap)
-        if detection["timestamp"] - last_timestamp > min_gap + interval:
-            # Finalize current segment
-            current_segment["end"] = last_timestamp
-            current_segment["robots"] = list(current_segment["robots"]) if current_segment["robots"] else ["Unknown Robots"]
-            segments.append(current_segment)
+        # Add match status
+        if "status" in match_info and match_info["status"]:
+            current_segment["match_status"].append({
+                "time": first_detection["timestamp"],
+                "status": match_info["status"]
+            })
+        
+        # Add sponsors if available
+        if "sponsors" in match_info and match_info["sponsors"]:
+            for sponsor in match_info["sponsors"].split("|"):
+                if sponsor.strip():
+                    current_segment["sponsors"].add(sponsor.strip())
+        
+        # Add damage reports if available
+        if "damage" in match_info and match_info["damage"]:
+            current_segment["damage_reports"].append({
+                "time": first_detection["timestamp"],
+                "description": match_info["damage"]
+            })
+    except ValueError:
+        # Handle case where extract_robot_names returns only 3 values (old format)
+        robot1, robot2, desc = extract_robot_names(first_detection["description"])
+        if robot1 and robot1 != "Unknown":
+            current_segment["robots"].add(robot1)
+        if robot2 and robot2 != "Unknown":
+            current_segment["robots"].add(robot2)
+        if desc:
+            current_segment["descriptions"].append({
+                "time": first_detection["timestamp"],
+                "text": desc
+            })
+    
+    # Process remaining detections
+    for detection in sorted_detections[1:]:
+        try:
+            # Extract robot names and match info
+            robot1, robot2, desc, match_info = extract_robot_names(detection["description"])
             
-            # Start new segment
-            current_segment = {
-                "start": detection["timestamp"],
-                "robots": set(),
-                "descriptions": []
-            }
+            # Check if this is part of the same segment based on time gap
+            # Or if match status indicates a new match starting
+            new_segment = False
+            if detection["timestamp"] - last_timestamp > min_gap + interval:
+                new_segment = True
+            elif "status" in match_info and match_info["status"] and "Match start" in match_info["status"]:
+                # Start a new segment if this is a match start and previous segment had content
+                if current_segment["descriptions"]:
+                    new_segment = True
+            
+            if new_segment:
+                # Finalize current segment
+                current_segment["end"] = last_timestamp
+                current_segment["robots"] = list(current_segment["robots"]) if current_segment["robots"] else ["Unknown Robots"]
+                current_segment["sponsors"] = list(current_segment["sponsors"]) if current_segment["sponsors"] else []
+                segments.append(current_segment)
+                
+                # Start new segment
+                current_segment = {
+                    "start": detection["timestamp"],
+                    "robots": set(),
+                    "descriptions": [],
+                    "sponsors": set(),
+                    "match_status": [],
+                    "damage_reports": []
+                }
+            
+            # Add robot names to current segment
             if robot1 and robot1 != "Unknown":
                 current_segment["robots"].add(robot1)
             if robot2 and robot2 != "Unknown":
                 current_segment["robots"].add(robot2)
+                
+            # Add description
+            if desc:
+                current_segment["descriptions"].append({
+                    "time": detection["timestamp"],
+                    "text": desc
+                })
+            
+            # Add match status
+            if "status" in match_info and match_info["status"]:
+                current_segment["match_status"].append({
+                    "time": detection["timestamp"],
+                    "status": match_info["status"]
+                })
+            
+            # Add sponsors if available
+            if "sponsors" in match_info and match_info["sponsors"]:
+                for sponsor in match_info["sponsors"].split("|"):
+                    if sponsor.strip():
+                        current_segment["sponsors"].add(sponsor.strip())
+            
+            # Add damage reports if available
+            if "damage" in match_info and match_info["damage"]:
+                current_segment["damage_reports"].append({
+                    "time": detection["timestamp"],
+                    "description": match_info["damage"]
+                })
+                
+        except ValueError:
+            # Handle case where extract_robot_names returns only 3 values (old format)
+            robot1, robot2, desc = extract_robot_names(detection["description"])
+            
+            # Check if this is part of the same segment (gap less than min_gap)
+            if detection["timestamp"] - last_timestamp > min_gap + interval:
+                # Finalize current segment
+                current_segment["end"] = last_timestamp
+                current_segment["robots"] = list(current_segment["robots"]) if current_segment["robots"] else ["Unknown Robots"]
+                current_segment["sponsors"] = list(current_segment["sponsors"]) if current_segment["sponsors"] else []
+                segments.append(current_segment)
+                
+                # Start new segment
+                current_segment = {
+                    "start": detection["timestamp"],
+                    "robots": set(),
+                    "descriptions": [],
+                    "sponsors": set(),
+                    "match_status": [],
+                    "damage_reports": []
+                }
+            
+            # Add robot names to current segment
+            if robot1 and robot1 != "Unknown":
+                current_segment["robots"].add(robot1)
+            if robot2 and robot2 != "Unknown":
+                current_segment["robots"].add(robot2)
+                
+            # Add description
             if desc:
                 current_segment["descriptions"].append({
                     "time": detection["timestamp"],
@@ -143,27 +300,78 @@ def group_segments(detections, interval, min_gap=5.0):
     # Finalize the last segment
     current_segment["end"] = last_timestamp
     current_segment["robots"] = list(current_segment["robots"]) if current_segment["robots"] else ["Unknown Robots"]
+    current_segment["sponsors"] = list(current_segment["sponsors"]) if current_segment["sponsors"] else []
     segments.append(current_segment)
     
     return segments
 
 def create_webvtt(segments, output_path):
-    """Create a WebVTT file from segments"""
+    """Create a WebVTT file from segments with enhanced information"""
     with open(output_path, 'w') as f:
         f.write("WEBVTT\n\n")
         
         for i, segment in enumerate(segments):
             robots_str = " vs ".join(segment["robots"][:2])  # Limit to two robots for readability
             
+            # Add sponsors if available
+            sponsors_str = ""
+            if "sponsors" in segment and segment["sponsors"]:
+                sponsors_list = [s for s in segment["sponsors"] if s]
+                if sponsors_list:
+                    sponsors_str = f" (Sponsors: {', '.join(sponsors_list[:3])})"  # Limit to 3 sponsors
+            
+            # Get match status from first entry if available
+            match_status = ""
+            if "match_status" in segment and segment["match_status"]:
+                match_status = f" [{segment['match_status'][0]['status']}]" if segment["match_status"] else ""
+            
             # Write segment header with start and end times
             f.write(f"{format_timestamp(segment['start'])} --> {format_timestamp(segment['end'])}\n")
-            f.write(f"[FIGHT {i+1}] {robots_str}\n\n")
+            f.write(f"[FIGHT {i+1}] {robots_str}{match_status}{sponsors_str}\n\n")
             
             # Write individual actions within segment if available
             for j, desc in enumerate(segment["descriptions"]):
                 if j > 0:  # Skip the first one as we already included it in the header
                     f.write(f"{format_timestamp(desc['time'])} --> {format_timestamp(desc['time'] + 3.0)}\n")
-                    f.write(f"[FIGHT {i+1}] {robots_str}: {desc['text']}\n\n")
+                    
+                    # Find matching match status and damage report for this timestamp if available
+                    status_at_time = ""
+                    if "match_status" in segment:
+                        for status_entry in segment["match_status"]:
+                            if abs(status_entry["time"] - desc["time"]) < 1.0:  # Within 1 second
+                                status_at_time = f" [{status_entry['status']}]"
+                                break
+                    
+                    damage_at_time = ""
+                    if "damage_reports" in segment and segment["damage_reports"]:
+                        for damage_entry in segment["damage_reports"]:
+                            if abs(damage_entry["time"] - desc["time"]) < 1.0:  # Within 1 second
+                                damage_at_time = f" (Damage: {damage_entry['description']})"
+                                break
+                    
+                    f.write(f"[FIGHT {i+1}] {robots_str}{status_at_time}: {desc['text']}{damage_at_time}\n\n")
+            
+            # Add specific match status changes
+            if "match_status" in segment and len(segment["match_status"]) > 1:
+                for status_entry in segment["match_status"][1:]:  # Skip the first one as we already included it
+                    # Only include significant status changes: Match start, Victory, Match end, Entanglement pause
+                    if any(key in status_entry["status"] for key in ["Match start", "Victory", "Match end", "Entanglement"]):
+                        f.write(f"{format_timestamp(status_entry['time'])} --> {format_timestamp(status_entry['time'] + 3.0)}\n")
+                        f.write(f"[FIGHT {i+1}] {robots_str}: STATUS CHANGE - {status_entry['status']}\n\n")
+            
+            # Add damage reports as separate entries if not already covered
+            if "damage_reports" in segment and segment["damage_reports"]:
+                for damage_entry in segment["damage_reports"]:
+                    # Check if this damage report wasn't already included with a description
+                    already_included = False
+                    for desc in segment["descriptions"]:
+                        if abs(desc["time"] - damage_entry["time"]) < 1.0:
+                            already_included = True
+                            break
+                    
+                    if not already_included:
+                        f.write(f"{format_timestamp(damage_entry['time'])} --> {format_timestamp(damage_entry['time'] + 3.0)}\n")
+                        f.write(f"[FIGHT {i+1}] {robots_str}: DAMAGE - {damage_entry['description']}\n\n")
     
     return output_path
 
@@ -316,27 +524,35 @@ class RobotFightDetector:
         # Prepare prompt for robot fight detection with robot identification
         event_context = f"\nThis is from the event: {self.event_name}.\n" if self.event_name else ""
         
-        prompt = f"""Look at this image carefully. Are there any robots fighting or engaging in combat?{event_context}
-        
-        If you see robots fighting, respond in this exact format:
-        YES. [Robot 1 Name] vs [Robot 2 Name]: Brief description of what's happening in the fight.
-        
-        If there are no robot fights, just respond with:
-        NO.
-        
-        For robot identification:
-        - Use actual robot names if visible in the image
-        - If names aren't visible, use "Red Bot" or "Blue Bot" based on their starting zones
-        - If zones aren't visible, use generic terms like "Bot 1" and "Bot 2" or describe them by appearance/weapons
-        - Avoid using any trademarked terms like "BattleBots" - use "combat robots" instead
-        
-        Look for:
-        - Robots in combat positions or arenas (combat robot competitions)
-        - Robot battles or fights with visible damage or attacks
-        - Names or identifiers of the robots (often visible on the robots or arena)
-        - Types of weapons the robots are using (spinners, flippers, hammers, etc.)
-        - The specific action happening at this moment (attacking, defending, etc.)
-        - Color zones (red/blue) that might indicate which robot is which"""
+        prompt = f"""Look at this image carefully and analyze if there are robot combat matches occurring.{event_context}
+
+Answer in one of these precise formats:
+
+If NO robots visible:
+NO ROBOTS.
+
+If robots visible but NOT fighting:
+NO FIGHT. [Brief description: setup, display, introduction, etc]
+
+If robots ARE fighting:
+YES. [Robot 1 Name] vs [Robot 2 Name]: [Brief action description]
+Status: [Match start/Ongoing/Entanglement pause/Match end/Victory]
+Sponsors: [Robot 1: sponsor names] | [Robot 2: sponsor names]
+Damage: [Description of visible damage to either robot]
+Timer: [Match timer if visible on screen]
+Score: [Points or score if displayed]
+
+For accurate analysis:
+- Typical matches last 2-3 minutes with 30-second countdowns
+- Watch for "3, 2, 1, FIGHT!" countdowns indicating match start
+- Note when referees pause matches for entanglements
+- Watch for match end signals (buzzer/horn/lights)
+- Victory can be by knockout (KO), technical knockout (TKO), or judges' decision
+- Look for sponsor logos on robots, arena barriers, or team uniforms
+- Note team members and their reactions for victory confirmation
+- Check displays/graphics for official match information
+- Observe damage indicators: sparks, detached parts, mobility issues
+- Be extremely strict - only report fighting if you're highly confident"""
         
         try:
             # Process with SmolVLM2 using the chat template API
@@ -386,6 +602,15 @@ class RobotFightDetector:
                 
                 # Check if robot fight is detected
                 is_robot_fight = response.upper().startswith('YES')
+                
+                # Also filter out "NO ROBOTS" responses
+                if response.upper().startswith('NO ROBOTS'):
+                    return False, response
+                
+                # Return false for "NO FIGHT" responses but keep the description
+                if response.upper().startswith('NO FIGHT'):
+                    return False, response
+                
                 return is_robot_fight, response
                 
         except Exception as e:
@@ -437,12 +662,26 @@ class RobotFightDetector:
                             frame_path = output_dir / frame_filename
                             cv2.imwrite(str(frame_path), frame)
                         
-                        detection = {
-                            "timestamp": timestamp,
-                            "frame_number": frame_count,
-                            "description": description,
-                            "frame_file": frame_filename
-                        }
+                        # Try to extract detailed match information if available
+                        try:
+                            robot1, robot2, desc, match_info = extract_robot_names(description)
+                            detection = {
+                                "timestamp": timestamp,
+                                "frame_number": frame_count,
+                                "description": description,
+                                "frame_file": frame_filename,
+                                "robot1": robot1,
+                                "robot2": robot2,
+                                "match_info": match_info
+                            }
+                        except ValueError:
+                            # Fall back to old format
+                            detection = {
+                                "timestamp": timestamp,
+                                "frame_number": frame_count,
+                                "description": description,
+                                "frame_file": frame_filename
+                            }
                         detections.append(detection)
                         click.echo(f"\n✓ Robot fight detected at {timestamp:.2f}s")
                         click.echo(f"  Description: {description}")
@@ -615,14 +854,28 @@ class RobotFightDetector:
                                 frame_path = output_dir / frame_filename
                                 cv2.imwrite(str(frame_path), frame)
                             
-                            # Add detection
-                            detection = {
-                                "timestamp": timestamp,
-                                "frame_number": frame_count,
-                                "description": description,
-                                "frame_file": frame_filename,
-                                "time": datetime.now().isoformat()
-                            }
+                            # Add detection with detailed match information if available
+                            try:
+                                robot1, robot2, desc, match_info = extract_robot_names(description)
+                                detection = {
+                                    "timestamp": timestamp,
+                                    "frame_number": frame_count,
+                                    "description": description,
+                                    "frame_file": frame_filename,
+                                    "time": datetime.now().isoformat(),
+                                    "robot1": robot1,
+                                    "robot2": robot2,
+                                    "match_info": match_info
+                                }
+                            except ValueError:
+                                # Fall back to old format
+                                detection = {
+                                    "timestamp": timestamp,
+                                    "frame_number": frame_count,
+                                    "description": description,
+                                    "frame_file": frame_filename,
+                                    "time": datetime.now().isoformat()
+                                }
                             detections.append(detection)
                             
                             # Create temporary clip if requested
@@ -784,11 +1037,52 @@ def detect(video_path, output_dir, interval, model, output_format, save_frames,
             click.echo(f"\nIdentified {len(results['segments'])} fight segments:")
             for i, segment in enumerate(results['segments']):
                 robots = " vs ".join(segment['robots'][:2])
-                click.echo(f"  • Fight {i+1}: {format_timestamp(segment['start'])} - {format_timestamp(segment['end'])} ({robots})")
+                
+                # Show sponsors if available
+                sponsors_info = ""
+                if "sponsors" in segment and segment["sponsors"]:
+                    sponsors_list = [s for s in segment["sponsors"] if s]
+                    if sponsors_list:
+                        sponsors_info = f" - Sponsors: {', '.join(sponsors_list[:3])}"
+                
+                # Show match status info if available
+                status_info = ""
+                if "match_status" in segment and segment["match_status"]:
+                    statuses = set(entry["status"] for entry in segment["match_status"] if entry["status"])
+                    if statuses:
+                        status_info = f" - Status: {', '.join(statuses)}"
+                
+                # Show damage info if available
+                damage_info = ""
+                if "damage_reports" in segment and segment["damage_reports"]:
+                    damage_info = f" - Damage detected"
+                
+                duration = segment['end'] - segment['start']
+                click.echo(f"  • Fight {i+1}: {format_timestamp(segment['start'])} - {format_timestamp(segment['end'])} ({duration:.1f}s) - {robots}{sponsors_info}{status_info}{damage_info}")
         elif results['total_detections'] > 0:
             click.echo("\nDetected robot fights:")
             for detection in results['detections']:
-                click.echo(f"  • {detection['timestamp']:.2f}s: {detection['description']}")
+                # Try to extract enhanced information if available
+                try:
+                    robot1, robot2, desc, match_info = extract_robot_names(detection['description'])
+                    
+                    status_info = ""
+                    if "status" in match_info and match_info["status"]:
+                        status_info = f" [{match_info['status']}]"
+                    
+                    sponsors_info = ""
+                    if "sponsors" in match_info and match_info["sponsors"]:
+                        sponsors_info = f" - Sponsors: {match_info['sponsors']}"
+                    
+                    damage_info = ""
+                    if "damage" in match_info and match_info["damage"]:
+                        damage_info = f" - Damage: {match_info['damage']}"
+                    
+                    click.echo(f"  • {detection['timestamp']:.2f}s: {robot1} vs {robot2}{status_info}{sponsors_info}{damage_info}")
+                
+                except ValueError:
+                    # Fall back to old format
+                    click.echo(f"  • {detection['timestamp']:.2f}s: {detection['description']}")
     
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
@@ -875,11 +1169,52 @@ def livestream(stream_url, output_dir, interval, model, output_format, save_fram
             click.echo(f"\nIdentified {len(results['segments'])} fight segments:")
             for i, segment in enumerate(results['segments']):
                 robots = " vs ".join(segment['robots'][:2])
-                click.echo(f"  • Fight {i+1}: {format_timestamp(segment['start'])} - {format_timestamp(segment['end'])} ({robots})")
+                
+                # Show sponsors if available
+                sponsors_info = ""
+                if "sponsors" in segment and segment["sponsors"]:
+                    sponsors_list = [s for s in segment["sponsors"] if s]
+                    if sponsors_list:
+                        sponsors_info = f" - Sponsors: {', '.join(sponsors_list[:3])}"
+                
+                # Show match status info if available
+                status_info = ""
+                if "match_status" in segment and segment["match_status"]:
+                    statuses = set(entry["status"] for entry in segment["match_status"] if entry["status"])
+                    if statuses:
+                        status_info = f" - Status: {', '.join(statuses)}"
+                
+                # Show damage info if available
+                damage_info = ""
+                if "damage_reports" in segment and segment["damage_reports"]:
+                    damage_info = f" - Damage detected"
+                
+                duration = segment['end'] - segment['start']
+                click.echo(f"  • Fight {i+1}: {format_timestamp(segment['start'])} - {format_timestamp(segment['end'])} ({duration:.1f}s) - {robots}{sponsors_info}{status_info}{damage_info}")
         elif results['total_detections'] > 0:
             click.echo("\nDetected robot fights:")
             for detection in results['detections']:
-                click.echo(f"  • {detection['timestamp']:.2f}s: {detection['description']}")
+                # Try to extract enhanced information if available
+                try:
+                    robot1, robot2, desc, match_info = extract_robot_names(detection['description'])
+                    
+                    status_info = ""
+                    if "status" in match_info and match_info["status"]:
+                        status_info = f" [{match_info['status']}]"
+                    
+                    sponsors_info = ""
+                    if "sponsors" in match_info and match_info["sponsors"]:
+                        sponsors_info = f" - Sponsors: {match_info['sponsors']}"
+                    
+                    damage_info = ""
+                    if "damage" in match_info and match_info["damage"]:
+                        damage_info = f" - Damage: {match_info['damage']}"
+                    
+                    click.echo(f"  • {detection['timestamp']:.2f}s: {robot1} vs {robot2}{status_info}{sponsors_info}{damage_info}")
+                
+                except ValueError:
+                    # Fall back to old format
+                    click.echo(f"  • {detection['timestamp']:.2f}s: {detection['description']}")
     
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
@@ -906,7 +1241,37 @@ def analyze_image(image_path, model, event_name):
         
         click.echo(f"\nImage: {image_path.name}")
         click.echo(f"Robot fight detected: {'YES' if is_fight else 'NO'}")
-        click.echo(f"Description: {description}")
+        
+        if is_fight:
+            try:
+                # Try to extract enhanced information
+                robot1, robot2, desc, match_info = extract_robot_names(description)
+                
+                click.echo(f"Robots: {robot1} vs {robot2}")
+                
+                if "status" in match_info and match_info["status"]:
+                    click.echo(f"Match status: {match_info['status']}")
+                
+                if "sponsors" in match_info and match_info["sponsors"]:
+                    click.echo(f"Sponsors: {match_info['sponsors']}")
+                
+                if "damage" in match_info and match_info["damage"]:
+                    click.echo(f"Damage: {match_info['damage']}")
+                
+                if "timer" in match_info and match_info["timer"]:
+                    click.echo(f"Timer: {match_info['timer']}")
+                
+                if "score" in match_info and match_info["score"]:
+                    click.echo(f"Score: {match_info['score']}")
+                
+                if desc:
+                    click.echo(f"Description: {desc}")
+            
+            except ValueError:
+                # Fall back to old format
+                click.echo(f"Description: {description}")
+        else:
+            click.echo(f"Description: {description}")
         
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
