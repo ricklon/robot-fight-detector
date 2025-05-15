@@ -31,13 +31,21 @@ pip install -e .
 
 ### Option 2: Install with uv (recommended for modern Python projects)
 
+[Astral's uv](https://docs.astral.sh/uv/) is an extremely fast Python package manager written in Rust that replaces pip, pip-tools, virtualenv and more.
+
 ```bash
+# Install uv if you don't have it
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
 # Clone the repository with GitHub CLI
 gh repo clone ricklon/robot-fight-detector
 cd robot-fight-detector
 
 # Install in development mode
 uv pip install -e .
+
+# Run commands with uv
+uv run python robot_fight_detector.py analyze-image examples/robot_sample.jpg
 
 # Alternative: install dependencies directly from pyproject.toml
 uv sync
@@ -187,14 +195,39 @@ Example JSON output:
       "timestamp": 14.5,
       "frame_number": 348,
       "description": "YES. [Gigabyte] vs [Free Shipping]: Spinner weapon hits opponent's front wedge.",
-      "frame_file": "robot_fight_14.50s.jpg"
+      "frame_file": "robot_fight_14.50s.jpg",
+      "robot1": "Gigabyte",
+      "robot2": "Free Shipping",
+      "match_info": {
+        "status": "Ongoing",
+        "sponsors": "Droid Rage Robotics | MetalCraft Industries",
+        "damage": "Free Shipping's front wedge showing dents and scratches",
+        "timer": "2:15 remaining",
+        "score": "Gigabyte: 3, Free Shipping: 1"
+      }
     },
     ...
   ],
   "settings": {
     "interval": 1.0,
     "model": "HuggingFaceTB/SmolVLM2-2.2B-Instruct"
-  }
+  },
+  "segments": [
+    {
+      "start": 14.5,
+      "end": 32.25,
+      "robots": ["Gigabyte", "Free Shipping"],
+      "sponsors": ["Droid Rage Robotics", "MetalCraft Industries"],
+      "match_status": [
+        {"time": 14.5, "status": "Ongoing"},
+        {"time": 31.0, "status": "Victory"}
+      ],
+      "damage_reports": [
+        {"time": 14.5, "description": "Free Shipping's front wedge showing dents and scratches"},
+        {"time": 25.75, "description": "Gigabyte's weapon smoking after impact"}
+      ]
+    }
+  ]
 }
 ```
 
@@ -211,16 +244,22 @@ Example WebVTT output:
 WEBVTT
 
 00:00:14:500 --> 00:00:32:250
-[FIGHT 1] Gigabyte vs Free Shipping
+[FIGHT 1] Gigabyte vs Free Shipping [Ongoing] (Sponsors: Droid Rage Robotics, MetalCraft Industries)
 
 00:00:17:750 --> 00:00:20:750
-[FIGHT 1] Gigabyte vs Free Shipping: Spinner weapon hits opponent's front wedge
+[FIGHT 1] Gigabyte vs Free Shipping [Ongoing]: Spinner weapon hits opponent's front wedge (Damage: Free Shipping's front wedge showing dents)
+
+00:00:25:750 --> 00:00:28:750
+[FIGHT 1] Gigabyte vs Free Shipping: STATUS CHANGE - Victory for Gigabyte
 
 00:01:05:100 --> 00:01:18:200
-[FIGHT 2] Tombstone vs Witch Doctor
+[FIGHT 2] Tombstone vs Witch Doctor [Match start] (Sponsors: Team Last Rites, Witch Doctor Team)
 
 00:01:10:100 --> 00:01:13:100
-[FIGHT 2] Tombstone vs Witch Doctor: Horizontal blade causes major damage
+[FIGHT 2] Tombstone vs Witch Doctor [Ongoing]: Horizontal blade causes major damage (Damage: Witch Doctor's weapon disabled)
+
+00:01:15:100 --> 00:01:18:100
+[FIGHT 2] Tombstone vs Witch Doctor: DAMAGE - Tombstone's weapon chain appears to be loose
 ```
 
 The WebVTT format can be used with most video players that support subtitles, allowing you to see fight segments and descriptions while watching the video. It's especially useful for long videos where you want to quickly navigate to the fight scenes.
@@ -261,6 +300,70 @@ flake8
 # Run tests
 pytest
 ```
+
+## Testing Examples
+
+Here are some examples to verify that the robot-fight-detector is working correctly:
+
+### Testing with Example Image
+
+```bash
+# Using pip installation
+robot-fight-detector analyze-image examples/robot_sample.jpg
+
+# Using uv
+uv run python robot_fight_detector.py analyze-image examples/robot_sample.jpg
+```
+
+Expected output:
+```
+Loading SmolVLM2 model on cuda...
+✓ Model loaded successfully!
+
+Image: robot_sample.jpg
+Robot fight detected: YES/NO
+[Detailed information about detected robots, match status, etc.]
+```
+
+### Testing with Short Video Segment
+
+```bash
+# Create a short test video clip (requires ffmpeg)
+ffmpeg -i videos/your_original_video.mp4 -t 20 -c:v copy -c:a copy videos/test_sample.mp4
+
+# Process the short clip
+uv run python robot_fight_detector.py detect videos/test_sample.mp4 --interval 2 --extract-clips --format vtt
+```
+
+Expected output:
+```
+Loading SmolVLM2 model on cuda...
+✓ Model loaded successfully!
+Processing video: test_sample.mp4
+[Robot fight detections with timestamps]
+Extracting fight clips...
+✓ Extracted clip 1: [clip filename]
+🤖 Analysis complete!
+```
+
+### Verifying Output Files
+
+After running detection, check the output directory:
+```bash
+ls -la robot_fights_output/
+```
+
+You should see:
+1. JSON report file (`*_robot_fights.json`)
+2. WebVTT file if requested (`*_robot_fights.vtt`)
+3. Frame images folder with detections
+4. `clips/` directory with extracted video segments
+
+### Common Issues
+
+- **CUDA out of memory**: Try increasing the `--interval` value to sample fewer frames
+- **Missing HuggingFace token**: Ensure your `.env` file contains a valid token
+- **Clip extraction fails**: Verify ffmpeg is installed and in your PATH
 
 ## License
 
