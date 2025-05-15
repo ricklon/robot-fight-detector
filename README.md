@@ -15,16 +15,35 @@ A CLI tool to detect robot fights in videos and images using SmolVLM2 vision lan
 
 Requirements:
 - Python 3.12.3 or higher
-- [uv](https://github.com/astral-sh/uv) package manager
 - [ffmpeg](https://ffmpeg.org/download.html) (required for clip extraction only)
 
+### Option 1: Install with pip
+
 ```bash
-# Clone the repository
-git clone https://github.com/ricklon/robot-fight-detector.git
+# Install directly from GitHub
+pip install git+https://github.com/ricklon/robot-fight-detector.git
+
+# Or install in development mode after cloning with GitHub CLI
+gh repo clone ricklon/robot-fight-detector
+cd robot-fight-detector
+pip install -e .
+```
+
+### Option 2: Install with uv (recommended for modern Python projects)
+
+```bash
+# Clone the repository with GitHub CLI
+gh repo clone ricklon/robot-fight-detector
 cd robot-fight-detector
 
-# Install dependencies
+# Install in development mode
+uv pip install -e .
+
+# Alternative: install dependencies directly from pyproject.toml
 uv sync
+
+# Or add to an existing project
+uv add git+https://github.com/ricklon/robot-fight-detector.git
 ```
 
 ### Environment Setup
@@ -41,6 +60,15 @@ cp .env.example .env
 
 # Edit the .env file and add your token
 # HUGGINGFACE_TOKEN=your_token_here
+```
+
+The `.env` file supports the following configurations:
+
+```
+HUGGINGFACE_TOKEN=your_huggingface_token_here    # Required
+MODEL_NAME=HuggingFaceTB/SmolVLM2-1.7B-Instruct  # Optional: alternative model
+OUTPUT_DIR=./robot_fights_output                 # Optional: default output directory
+DEFAULT_INTERVAL=1.0                             # Optional: frame sampling interval
 ```
 
 ## Usage
