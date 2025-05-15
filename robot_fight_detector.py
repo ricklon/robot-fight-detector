@@ -543,7 +543,7 @@ Timer: [Match timer if visible on screen]
 Score: [Points or score if displayed]
 
 For accurate analysis:
-- Typical matches last 2-3 minutes with 30-second countdowns
+- Typical matches last 2-5 minutes (usually with a 3-minute timer)
 - Watch for "3, 2, 1, FIGHT!" countdowns indicating match start
 - Note when referees pause matches for entanglements
 - Watch for match end signals (buzzer/horn/lights)
